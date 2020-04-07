@@ -15,8 +15,10 @@ parser.add_argument('-out', '--output_dir',
                     help='specify output dir path for save jpg')
 parser.add_argument('-f', '--flat', action='store_true',
                     help='convert to output_dir without dirs hierarchy')
-parser.add_argument('-q', '--quality', type=float, default=2.5,
+parser.add_argument('-q', '--quality', type=float, default=2,
                     help='specify convert quality')
+parser.add_argument('-p', '--processes', type=int,
+                    help='specify number of processor cores')
 args = parser.parse_args()
 
 
@@ -109,7 +111,8 @@ if __name__ == '__main__':
     except PDFExtractorError as e:
         logging.error(e.message)
     else:
-        with Pool() as pool:
+        processes = args.processes if args.processes else None
+        with Pool(processes=processes) as pool:
             if args.flat:
                 errors = pool.map(convert_without_hierarchy, pdfs_)
             else:
@@ -120,7 +123,9 @@ if __name__ == '__main__':
             if errors:
                 with open('errors.log', 'w', encoding='utf-8') as log:
                     log.writelines(errors)
+                logging.warning(f'{"".join(errors)}')
                 logging.warning('errors was found, see errors.log')
+
         print(f'elapsed time is {int((time() - start) * 100) / 100} sec')
     finally:
         print('all tasks is done')
