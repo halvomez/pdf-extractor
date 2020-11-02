@@ -1,11 +1,12 @@
-import os
-import uuid
-import logging
 import argparse
-import fitz
-from time import time
+import hashlib
+import logging
+from multiprocessing import Pool, Lock
 from pathlib import Path
-from multiprocessing import Pool
+from time import time
+from typing import List, Union
+
+import fitz
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -14,7 +15,7 @@ parser.add_argument('input_dir', help='specify input dir path for convert')
 parser.add_argument('-out', '--output_dir',
                     help='specify output dir path for save jpg')
 parser.add_argument('-f', '--flat', action='store_true',
-                    help='convert to output_dir without dirs hierarchy')
+                    help='convert without save dirs hierarchy')
 parser.add_argument('-q', '--quality', type=float, default=2,
                     help='specify convert quality')
 parser.add_argument('-p', '--processes', type=int,
@@ -27,105 +28,85 @@ class PDFExtractorError(Exception):
         self.message = 'can\'t load images, check input dir'
 
 
-def collect_pdf_for_convert(input_dir):
-    pdfs = []
-    for (root, dirs, files) in os.walk(input_dir, topdown=True):
-        for file in files:
-            if file.split('.')[-1].lower() == 'pdf':
-                pdfs.append(os.path.join(root, file))
+def collect_pdfs_for_convert(input_dir: str) -> List[Path]:
+    pdfs_ = [file for file in Path(input_dir).glob('**/*.*') if
+             file.suffix.lower() == '.pdf']
 
-    if not pdfs:
+    if not pdfs_:
         raise PDFExtractorError()
 
-    return pdfs
+    return pdfs_
 
 
-def saving_img_pages(file, target_path, postfix=None):
-    fname = str(Path(file).stem)
+def convert_file(file: Path) -> Union[bool, str]:
+    print(f' converting {file}')
+
     try:
         with open(file, 'rb') as f:
-            buf = f.read()
-            postfix_ = uuid.uuid4().time_low
+            f_content = f.read()
+            new_fname = f'{hashlib.blake2b(f_content).hexdigest()[:12]}'
 
-            with fitz.Document(fname, buf) as doc:
-                new_fname = f'{fname}_{postfix_}' if postfix else fname
+            if args.flat:
+                target_dir = Path(
+                    args.output_dir if args.output_dir else args.input_dir)
+            else:
+                fpath_parts = Path(file).parts
+                ipath_parts = Path(args.input_dir).parts
+
+                target_dir = Path(args.output_dir) / Path(*fpath_parts[len(
+                    ipath_parts):-1]) if args.output_dir else file.parent
+
+            Path(target_dir).mkdir(exist_ok=True)
+
+            with fitz.Document(new_fname, f_content) as doc:
                 if doc.pageCount > 1:
                     for page in doc:
                         mat = fitz.Matrix(args.quality, args.quality)
                         pix = page.getPixmap(matrix=mat, alpha=False)
-                        pix.writeImage(
-                            os.path.join(target_path,
-                                         f'{new_fname}-page{page.number + 1}.jpg'))
+                        page_name = f'{new_fname}-page{page.number + 1}.jpg'
+                        with lock:
+                            pix.writeImage(str(target_dir / page_name))
 
                 else:
                     pix = doc[0].getPixmap()
-                    pix.writeImage(
-                        os.path.join(target_path, f'{new_fname}.jpg'))
+                    with lock:
+                        pix.writeImage(str(target_dir / f'{new_fname}.jpg'))
 
-            return None
+        return True
     except (RuntimeError, IndexError) as err:
-        return f'error: {err}, file: {str(Path(file))}\n'
+        return f'error: {err}, file: {file}\n'
 
 
-def convert_with_hierarchy(file):
-    print(f' converting {file}')
-    processing_path = str(Path(file).parent)
-
-    fpath_parts = Path(file).parts
-    ipath_parts = Path(args.input_dir).parts
-
-    if not args.output_dir:
-        target_path = processing_path
-    else:
-        target_path = os.path.join(args.output_dir,
-                                   *fpath_parts[len(ipath_parts):-1])
-
-    if not os.path.exists(target_path):
-        os.makedirs(target_path, exist_ok=True)
-
-    return saving_img_pages(file, target_path)
-
-
-def convert_without_hierarchy(file):
-    print(f' converting {file}')
-
-    if not args.output_dir:
-        target_path = os.path.join(*Path(file).parts[:2])
-    else:
-        target_path = args.output_dir
-
-    if not os.path.exists(target_path):
-        os.makedirs(target_path, exist_ok=True)
-
-    return saving_img_pages(file, target_path, postfix=True)
+def init_lock(l: Lock) -> None:
+    global lock
+    lock = l
 
 
 if __name__ == '__main__':
     start = time()
 
-    if os.path.exists('errors.log'):
-        os.remove('errors.log')
+    Path('errors.log').unlink(missing_ok=True)
 
     try:
-        pdfs_ = collect_pdf_for_convert(args.input_dir)
+        pdfs = collect_pdfs_for_convert(args.input_dir)
     except PDFExtractorError as e:
         logging.error(e.message)
     else:
-        processes = args.processes if args.processes else None
-        with Pool(processes=processes) as pool:
-            if args.flat:
-                errors = pool.map(convert_without_hierarchy, pdfs_)
-            else:
-                errors = pool.map(convert_with_hierarchy, pdfs_)
+        lock = Lock()
+        pool = Pool(processes=args.processes if args.processes else None,
+                    initializer=init_lock, initargs=(lock,))
 
-            errors = [e for e in errors if e is not None]
+        results = pool.map(convert_file, pdfs)
+        pool.close()
+        pool.join()
 
-            if errors:
-                with open('errors.log', 'w', encoding='utf-8') as log:
-                    log.writelines(errors)
-                logging.warning(f'{"".join(errors)}')
-                logging.warning('errors was found, see errors.log')
+        errors = [x for x in results if x is not True]
 
-        print(f'elapsed time is {int((time() - start) * 100) / 100} sec')
-    finally:
-        print('all tasks is done')
+        if errors:
+            with open('errors.log', 'w', encoding='utf-8') as log:
+                log.writelines(errors)
+            logging.warning(f'{"".join(errors)}')
+            logging.warning('errors was found, see errors.log')
+
+    print(f'elapsed time is {time() - start:.2f} sec')
+    print('all tasks is done')
