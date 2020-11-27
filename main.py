@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import logging
+from dataclasses import dataclass
 from multiprocessing import Pool, Lock
 from pathlib import Path
 from time import time
@@ -23,14 +24,16 @@ parser.add_argument('-p', '--processes', type=int,
 args = parser.parse_args()
 
 
+@dataclass
 class PDFExtractorError(Exception):
-    def __init__(self):
-        self.message = 'can\'t load images, check input dir'
+    message: str = 'can\'t load pdf files, check input dir'
 
 
 def collect_pdfs_for_convert(input_dir: str) -> List[Path]:
-    pdfs_ = [file for file in Path(input_dir).glob('**/*.*') if
-             file.suffix.lower() == '.pdf']
+    pdfs_ = [
+        file for file in Path(input_dir).glob('**/*.*')
+        if file.suffix.lower() == '.pdf'
+    ]
 
     if not pdfs_:
         raise PDFExtractorError()
@@ -47,8 +50,7 @@ def convert_file(file: Path) -> Union[bool, str]:
             new_fname = f'{hashlib.blake2b(f_content).hexdigest()[:12]}'
 
             if args.flat:
-                target_dir = Path(
-                    args.output_dir if args.output_dir else args.input_dir)
+                target_dir = Path(args.output_dir or args.input_dir)
             else:
                 fpath_parts = Path(file).parts
                 ipath_parts = Path(args.input_dir).parts
@@ -59,16 +61,18 @@ def convert_file(file: Path) -> Union[bool, str]:
             Path(target_dir).mkdir(exist_ok=True)
 
             with fitz.Document(new_fname, f_content) as doc:
+                mat = fitz.Matrix(2, 2)
+
                 if doc.pageCount > 1:
                     for page in doc:
-                        mat = fitz.Matrix(args.quality, args.quality)
                         pix = page.getPixmap(matrix=mat, alpha=False)
                         page_name = f'{new_fname}-page{page.number + 1}.jpg'
+
                         with lock:
                             pix.writeImage(str(target_dir / page_name))
-
                 else:
-                    pix = doc[0].getPixmap()
+                    pix = doc[0].getPixmap(matrix=mat, alpha=False)
+
                     with lock:
                         pix.writeImage(str(target_dir / f'{new_fname}.jpg'))
 
@@ -84,7 +88,6 @@ def init_lock(l: Lock) -> None:
 
 if __name__ == '__main__':
     start = time()
-
     Path('errors.log').unlink(missing_ok=True)
 
     try:
@@ -93,8 +96,11 @@ if __name__ == '__main__':
         logging.error(e.message)
     else:
         lock = Lock()
-        pool = Pool(processes=args.processes if args.processes else None,
-                    initializer=init_lock, initargs=(lock,))
+        pool = Pool(
+            processes=args.processes or None,
+            initializer=init_lock,
+            initargs=(lock,),
+        )
 
         results = pool.map(convert_file, pdfs)
         pool.close()
